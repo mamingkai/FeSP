@@ -1,0 +1,259 @@
+---
+title: "functions_MCMC"
+author: "Mingkai Ma"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+# Default model parameters
+```{r packages}
+require(deSolve)
+require(FME)
+require(here)
+require(ggplot2)
+require(beepr)
+require(cowplot)
+```
+
+
+```{r eval=T}
+FeSPmodel <- function(t, state, parms) {
+  with (as.list(c(state, parms)),{
+
+    # do this to avoid that the power of a tiny negative number gives NaN
+    Fe        <- max(0, Fe)
+    S         <- max(0, S)
+    P         <- max(0, P)
+    Sads      <- max(0, Sads)
+    Pads.slow <- max(0, Pads.slow)
+    Pads.fast <- max(0, Pads.fast)
+
+    # convert rate constants from log10-scale to lin-scale
+    kFe       <- 10^log_kFe # [mmol Fe min-1]
+    kPads     <- 10^log_kPads
+    kPads     <- 10^log_kPads
+    kS.fast   <- 10^log_kS.fast
+    kS.slow   <- 10^log_kS.slow
+    kSads     <- 10^log_kSads
+
+    # calculate additional rate constants
+    kPdes    <- kPads/kPads2kdes
+    kSdes     <- kSads/kSads2kdes
+    D         <- 1/tau
+
+    # rate expressions [mol/m3/d]
+    #R         <- kFe   * S^m * Fe.ini^(1-n) * Fe^n
+    Fe.term <- ifelse(Fe.ini<0.01,0,Fe.ini^(1-n) * Fe^n)#in case Fe=0 then gives a NA
+    R         <- kFe   * S^m * Fe.term
+    Rads      <- kPads * P   * Fe.term
+    RSads     <- kSads * S   * Fe.term
+    RSdes     <- kSdes * Sads
+    Rdes.fast <- kPdes * Pads.fast
+    Rdes.slow <- kPdes * Pads.slow
+    RHS.fast  <- kS.fast^y * Pads.fast * S^y
+    RHS.slow  <- kS.slow^y * Pads.slow * S^y
+    RPdes.term<- ifelse(Fe.ini<0.01,0,R * (Pads.fast+Pads.slow)/Fe)
+    # (Pads.fast+Pads.slow)/Fe)#incase Fe=0,gives NA
+    # RPdes.stoi <- kPdes* RPdes.term # = kPdes* RPdes.term,however it`s fitted without the k for now.
+    RPdes.stoi <- RPdes.term
+    Sinflow   <- D * Sin
+    Soutflow  <- D * S
+    Poutflow  <- D * P
+
+    # Time-derivatives:
+    dFe.dt        <- -R
+    dS.dt         <- -3/2*R + Sinflow - Soutflow - RSads + RSdes
+    dSads.dt      <-  RSads - RSdes
+    dP.dt         <- -Rads + RPdes.stoi + RHS.fast + RHS.slow - Poutflow
+    dPads.fast.dt <-  Rads * x.fast      - Rdes.fast - RHS.fast - R*((Pads.fast)/Fe)
+    dPads.slow.dt <-  Rads * (1-x.fast)  - Rdes.slow - RHS.slow - R*((Pads.slow)/Fe)
+
+    list(c(dFe.dt, dS.dt, dSads.dt, dP.dt, dPads.fast.dt, dPads.slow.dt),
+
+         # other output: process rates
+         R.Fe        = R,
+         R.Pads      = Rads,
+         R.Pdes.slow = Rdes.slow,
+         R.Pdes.fast = Rdes.fast,
+         R.Pdes.stoi = RPdes.stoi,
+         RHS.slow    = RHS.slow,
+         RHS.fast    = RHS.fast,
+         R.Sads      = RSads,
+         R.Sdes      = RSdes
+    )
+  })
+}
+```
+<!-- These two code-chunks load the required functions. They can be eddited separately. -->
+# Implement the model in R
+
+Here, define the model function, which calculates time-derivatives of the state variables.
+
+
+
+# Auxiliary functions
+
+Here, we define auxiliary functions.
+
+## Implementation of the model
+
+Function for loading input data from a list of data files. ``var`` specifies which experimental variables, in addition to ``time``, should be returned.
+
+```{r}
+getExpData <- function(data_choice=7, vars=c("S","P")){
+  # input folder
+  bdir <- paste(here(), "/src/FeSPads/data/", sep="")
+
+  # all available input file names
+  data_files <- c("pH7373R1.csv",
+                  "pH7373R2.csv",
+                  "pH7373R3.csv",
+                  "pH7373R4.csv",
+                  "pH7373R5.csv",
+                  "pH7383R4.csv",
+                  "pH7383R5.csv",
+                  "pH8373R4.csv",
+                  "pH8373R5.csv",
+                  "pH8383R4.csv",
+                  "pH8383R5.csv")
+
+  # load the data from a specific file
+  input_file  <- paste(bdir, data_files[data_choice], sep="")
+  data <- read.csv(file = input_file)
+  data <- data[,c("time", vars)] # extract time and specific variables
+  return( data.frame( data ) )
+}
+```
+
+Function to define initial values of the modeled state variables from the model parameters passed as input.
+
+```{r}
+ini.fun <- function(pars){
+  with(as.list(pars),{
+    ini <- c( Fe        = Fe.ini, 
+              S         = S.ini, 
+              Sads      = Sads.ini, 
+              P         = P.ini, 
+              Pads.fast = Pads.ini*x.fast, 
+              Pads.slow = Pads.ini*(1-x.fast) )
+    return(ini)
+  })
+}
+```
+
+Function to solve the model for a given set of model parameters (passed as input). This is required because of the way the fitting procedure works (see below).
+
+```{r}
+std.fun <- function(pars){
+  ini <- ini.fun(pars)
+  out <- ode(y=ini, func=FeSPmodel, parms=pars, times=outtimes, method="daspk")
+  return(out)
+}
+```
+
+## Implementation of fitting
+
+First, define a function ("model cost" function) that runs the model for a given set of initial values and model parameters (input arguments) and compares the output to the experimental data.
+
+```{r}
+modCost.fun <- function(fitpar, OBS){
+  p <- pars
+  p[names(fitpar)] <- fitpar
+  outtimes <- OBS[,"time"]
+  return(modCost(model = std.fun(p),
+                 obs = OBS, 
+                 x = "time",              # independent variable name
+                 # weight = "mean"
+                 ))
+}
+```
+
+
+
+
+```{r}
+fit_simple <- function(pIni, pMin, pMax, OBS){
+  # perform simple fitting
+  PFit <- modFit(f=modCost.fun, OBS=OBS,
+                 p=pIni, lower=pMin, upper=pMax, 
+                 method = "L-BFGS-B") # the "L-BFGS-B" method seems to work best!!"Marq", "Port", "Newton",
+           # "Nelder-Mead", "BFGS", "CG", "L-BFGS-B", "SANN",
+           # "Pseudo", "bobyqa"
+  # compare the results
+  p <- pars
+  p[names(PFit$par)] <- PFit$par
+  original <- std.fun(pars)
+  bestfit  <- std.fun(p)
+  plot(original, bestfit, lty=1, lwd=2, obs=OBS, obspar = list(pch=16, col="blue"))
+  legend("bottomright", legend=c("original", "best (simple_fit)"), 
+         bty = "n", lty=1, lwd=2, col=1:2)
+  return(PFit)
+}
+```
+
+
+```{r}
+fit_MCMC <- function(PFit, pMin_MCMC, pMax_MCMC, OBS, N.iter=2000,wvar0=0,updatecov=100,burninlength=200,jump,covscale){
+  SFit <- summary(PFit)
+  Covar <- SFit$cov.scaled * 2.4^2/length(PFit$par) # * 2.4^2/length(parameters)
+  s2prior <- SFit$modVariance
+  MCMC <- modMCMC(f=modCost.fun, p=PFit$par, lower=pMin_MCMC, upper=pMax_MCMC,OBS=OBS, var0=s2prior, 
+                  jump=jump, #if MCMC cant work through, change covar to 0.5, does not understand this at all however,worth a shot
+                  wvar0=wvar0, # could try to change this wvar0 to 1.also does not understand at all what this means
+                  updatecov=updatecov, 
+                  niter=N.iter,
+                  burninlength = burninlength,
+                  covscale=covscale)
+  return(MCMC)
+}
+```
+
+```{r plotting sR with only mean+ - sd,functions}
+fun_plot_sens_SP <- function(df,obs=DATA, species) {
+  # Subset the data frame based on the pattern
+  filtered_df <- df[grep(paste0("^", species, "\\d+"), rownames(df)), ]
+species_column <- species
+  # Plot the data
+  ggplot() +
+    # geom_line(data = as.data.frame(out), aes(x = time, y = as.data.frame(out)[[species_column]])) +
+    geom_line(data = filtered_df, aes(x = x, y =Mean))+ #plot mean, then the line will be inbetween the shade
+    geom_point(data = obs, aes(x = time, y = obs[,species_column])) +
+    geom_ribbon(data = filtered_df, aes(x = x, ymin = Mean - Sd, ymax = Mean + Sd), alpha = 0.5, color = "grey") +
+    labs(x = "time (min)", 
+         y = paste("Conc.", species, "(mM)"))
+}
+
+fun_plot_sens_others <- function(df = summary_sR, species,num_cols,plot=T) {
+  # Subset the data frame based on the pattern
+  # Create a list to store the ggplot objects for each species
+  plot_list <- list()
+  
+  for (sp in species) {
+
+    filtered_df <- df[grep(paste0("^", sp, "\\d+"), rownames(df)), ]
+
+    # Get the column name for the species
+    species_column <- sp
+    
+    # Plot the data for the current species
+    p <- ggplot() +
+      geom_line(data = filtered_df, aes(x = x, y =Mean))+
+      # geom_line(data = as.data.frame(out), aes(x = time, y = as.data.frame(out)[[species_column]])) + #plot the actual fit line
+      geom_ribbon(data = filtered_df, aes(x = x, ymin = Mean - Sd, ymax = Mean + Sd), alpha = 0.5, color = "grey") + #plot the mean from MCMC
+      labs(x = "time (min)", y = paste("Conc.", species_column, "(mM)"))
+    
+    # Add the plot to the list
+    plot_list[[sp]] <- p
+  }
+  
+  # Create a multi-panel plot using facet_wrap()
+  # num_cols <- ifelse(length(species) <= 4, 1, 2)
+  multi_plot <- cowplot::plot_grid(plotlist = plot_list, ncol = num_cols)
+
+  # Return multi_plot by default, and optionally return plot_list if specified
+    if (plot) {
+    return(multi_plot)
+  } else {
+    return(plot_list)
+  }
+}
+```

@@ -1,0 +1,239 @@
+---
+title: "Fitting of data by the FeSPads model"
+author: "Lubos Polerecky, Mingkai Ma, Thilo Behrends"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: pdf_document
+---
+
+```{r, echo=FALSE, message=FALSE}
+require(deSolve)
+require(FME)
+require(here)
+require(ggplot2)
+require(beepr)
+require(cowplot)
+knitr::knit("MCMC_functions_30June2023.Rmd")
+
+```
+
+parameters, which can be copy paste from LP_parms_pHXXXX.r
+```{r seperate parameters}
+data <- paste0("pH8383R4")
+default.pars <- list(
+  tau         = 25,     # residence time [min]; tau=V/Q, Q = 1 mL/min, V = 25 mL
+  n           = 1,
+  m           = 1,
+  y           = 1,
+  kSads2kdes  = 0.4,
+  log_kSads   = 0,
+  log_kFe     = -2.7,
+  Sin         = 1.8,    # [mmol S], inflow Stot concentration
+  kPads2kdes  = 0.33,
+  log_kPads   = -4,
+  log_kS.fast = -0.73,
+  log_kS.slow = -2.7,
+  PS_interference = 0.0008,
+  Fe.ini      = 10.3,   # [mmol Fe], initial mineral loading
+  P.ini       = 0,
+  Pads.ini    = 0.0,
+  x.fast      = 0.3,
+  S.ini       = 0,
+  Sads.ini    = 0
+)
+
+# data-specific values for specific parameters (limit to max of 5!)
+Fe.ini   <- c(0, 9.4, 9.6, 9.5, 8.5)
+P.ini    <- c(0, 0.000, 0.000, 0.0125,  0.0045)
+Pads.ini <- c(0, 0.000, 0.000, 0.065,  0.055)
+x.fast   <- c(0, 0.000, 0.000, 0.400,  0.400)
+
+num_data <- as.numeric(substr(data, nchar(data), nchar(data)))
+default.pars$Fe.ini <- Fe.ini[num_data]
+default.pars$P.ini <- P.ini[num_data]
+default.pars$Pads.ini <- Pads.ini[num_data]
+default.pars$x.fast <- x.fast[num_data]
+
+
+```
+
+# Fitting of actual data
+
+<!-- In the following chunks we define the fitting preferences, i.e., which dataset will be fitted and what the are fitting parameters. Toggle the eval=FALSE or eval=TRUE option to choose which one is evaluated. -->
+
+<!-- dataset 1 -->
+
+```{r, eval=TRUE, echo=TRUE}
+print(as.data.frame(default.pars))
+data_choice <- 10  # experimental dataset
+# sens_factor <- 2
+# define fitting parameters (the others remain fixed, including their min/max range), here the trick used is to arbitary define the best fit and pass it to the model
+pIni <- c( log_kFe = -2.7,log_kS.fast= -0.73,log_kS.slow = -2.7,0.400)
+pMin <- pIni-0.01#here to get the bestfit,which is our fit
+pMax <- pIni+0.01
+
+
+# pMin_MCMC <- pIni * 1/sens_factor
+# pMax_MCMC <- pIni * sens_factor
+
+# Adjust pMax_MCMC and pMin_MCMC for negative values
+
+# pMax_MCMC[pMax_MCMC < 0] <- pIni[pMax_MCMC < 0] * 1/sens_factor
+# pMin_MCMC[pMin_MCMC < 0] <- pIni[pMin_MCMC < 0] *  sens_factor
+pMin_MCMC <- c(-4,-4,-4,0.01)
+pMax_MCMC <- c(4,4,4,0.45)
+# Adjust elements with value 0 to ±0.5
+pMax_MCMC[pIni == 0] <- 0.5
+pMin_MCMC[pIni == 0] <- -0.5
+# pMin_MCMC <- c( -Inf, -Inf,-Inf)
+# pMax_MCMC <- c(Inf,Inf,Inf)
+
+# define model parameters that will remain fixed (start with default values)
+pars <- default.pars        # set default model parameters
+# pars["log_kS.fast"] <- -0.73
+# pars["log_kS.slow"] <- -2.7
+# pars["Sin"] <- 1.6
+# pars["Fe.ini"] <- 11.6
+# #pars["log_kFe"] <- -1.62
+# pars["x.fast"] <- 0.23
+```
+
+<!-- more datasets and fitting parameters can be added HERE. Don't forget to toggle the eval=FALSE or eval=TRUE option to choose which one is evaluated. -->
+
+<!-- The following chunk performs the actual fitting and sensitivity analysis. -->
+
+## Data set `r data_choice`
+
+Now, we are ready to perform the fitting process, step by step. These
+are the fitting parameters and the corresponding range to be explored by
+the MCMC method during fitting (minimal/maximal).
+
+```{r}
+data.frame(pIni = pIni, pMin = pMin, pMax = pMax)
+data.frame(pIni = pIni, pMin = pMin_MCMC, pMax = pMax_MCMC)
+```
+First, we load the experimental data, update all model parameters, and define outtimes.
+
+```{r}
+DATA_8383r4 <- DATA <- getExpData(data_choice)  # load experimental data
+pars[names(pIni)] <- pIni            # ensure that all parameters are updated
+outtimes <- DATA[,"time"]   
+
+# outtimes <- seq(from = 0, to = 450, length.out = 250)              # define outtimes based on exp. data
+# define outtimes based on exp. data
+```
+
+Next, we plot the experimental data together with the model prediction to verify whether the guessed model parameters are "close enough".
+
+```{r}
+out <- std.fun(pars)                   # calculate solution
+plot(out, lwd=2, obs=DATA, obspar = list(pch=16, col="blue"))
+```
+
+Next, we perform the "simple" and MCMC fitting. Note that this step may take a while depending on the number of iterations in the MCMC method.
+
+```{r Pfit}
+PFit <- fit_simple(pIni=pIni, pMin=pMin, pMax=pMax, OBS=DATA)
+summary(PFit)
+beep()
+```
+```{r}
+# manually calculate the residual error
+real_data_S <- DATA[,"S"]
+real_data_P <- DATA[,"P"]
+fit_data_S <- out[,"S"]
+fit_data_P <- out[,"P"]
+residuls_S <- fit_data_S-real_data_S
+residuls_P <- fit_data_P-real_data_P
+residual_sum_of_squares <- sum(residuls_S^2)+sum(residuls_P^2)
+degrees_of_freedom <- 84
+residual_variance <- residual_sum_of_squares / degrees_of_freedom
+residual_standard_error <- sqrt(residual_variance)#the residual_standard_error should match with PFit summary, which indicates the sentence "Residual standard error: 0.08787 on 84 degrees of freedom"
+print(residual_standard_error)
+```
+
+
+
+```{r}
+vars <- c("S","P")
+N.iter = 2000
+MCMC <- fit_MCMC(PFit=PFit, pMin_MCMC=pMin_MCMC, pMax_MCMC=pMax_MCMC, OBS=DATA, N.iter,wvar0 = 0,updatecov = 2000,burninlength = 200,jump = NULL,covscale = Covar)
+beep(sound = 2)
+```
+
+Next, we show results of the Markov chain fitting, including the estimated fitting parameters.
+
+```{r}
+plot(MCMC, mfrow=c(1,length(PFit$par)))
+beep(sound = 2)
+```
+
+```{r}
+tiff("mcmc_plot_8383R4.tiff",width = 6, height = 6, units = 'in', res = 300)
+if (length(PFit$par)>1) pairs(MCMC,pch = ".", cex = 0.5)
+# # display summary (estimates of the fitting parameters)
+summary(MCMC)
+summaryMC_8383r4 <- summary(MCMC)
+dev.off()
+beep()
+```
+
+Finally, we perform sensitivity analysis. This part usually does not work out. Thus, manual sensitivity analysis is performed.
+
+```{r,eval= T}
+sR <- sensRange(parms=pars, parInput=MCMC$pars, f=std.fun)
+plot(summary(na.omit(sR)),  obs=DATA, obspar=list(pch=16, col="red"))
+beep(sound=4)
+```
+
+
+```{r plots}
+summary_sR_8383r4 <- as.data.frame(summary(sR))
+plot_sens_S <- fun_plot_sens_SP(summary_sR_8383r4,obs = DATA_8383r4,species = "S")+theme_bw()
+plot_sens_P <- fun_plot_sens_SP(summary_sR_8383r4,obs = DATA_8383r4,"P")+theme_bw()
+
+plot_sens_conc <- fun_plot_sens_others(df = summary_sR_8383r4,species = c("Fe","Sads", "Pads.fast","Pads.slow"),num_cols = 2,plot=F)
+plot_sens_rates <- fun_plot_sens_others(df = summary_sR_8383r4,species = c("R.Fe","R.Pads", "R.Pdes.fast","R.Pdes.slow","R.Pdes.stoi","RHS.fast","RHS.slow","R.Sads","R.Sdes"),num_cols = 3,plot=F)
+
+
+plot_sens_conc[[1]] <- plot_sens_conc[[1]]+
+  ylab("Conc. Fe (mM)")
+plot_sens_conc[[2]] <- plot_sens_conc[[2]]+
+  ylab(expression(paste("Conc. S"[ads]," (mM)")))
+plot_sens_conc[[3]] <- plot_sens_conc[[3]]+
+  ylab(expression(paste("Conc. P"[ads.fast]," (mM)")))
+plot_sens_conc[[4]] <- plot_sens_conc[[4]]+
+  ylab(expression(paste("Conc. P"[ads.slow]," (mM)")))
+
+plot_sens_rates[[1]] <- plot_sens_rates[[1]]+
+  ylab(expression(paste("Rate Fe"[]," (mmol/L\u00B7 min)")))
+plot_sens_rates[[2]] <- plot_sens_rates[[2]]+
+  ylab(expression(paste("Rate P"[ads]," (mmol/L\u00B7 min)")))
+plot_sens_rates[[3]] <- plot_sens_rates[[3]]+
+  ylab(expression(paste("Rate P"[des.fast]," (mmol/L\u00B7 min)")))
+plot_sens_rates[[4]] <- plot_sens_rates[[4]]+
+  ylab(expression(paste("Rate P"[des.slow]," (mmol/L\u00B7 min)")))
+plot_sens_rates[[5]] <- plot_sens_rates[[5]]+
+  ylab(expression(paste("Rate P"[des.stoi]," (mmol/L\u00B7 min)")))
+plot_sens_rates[[6]] <- plot_sens_rates[[6]]+
+  ylab(expression(paste("Rate HS"[fast]," (mmol/L\u00B7 min)")))
+plot_sens_rates[[7]] <- plot_sens_rates[[7]]+
+  ylab(expression(paste("Rate HS"[slow]," (mmol/L\u00B7 min)")))
+plot_sens_rates[[8]] <- plot_sens_rates[[8]]+
+  ylab(expression(paste("Rate S"[ads]," (mmol/L\u00B7 min)")))
+plot_sens_rates[[9]] <- plot_sens_rates[[9]]+
+  ylab(expression(paste("Rate S"[des]," (mmol/L\u00B7 min)")))
+
+plot_sens_S_8383r4 <- plot_sens_S
+plot_sens_P_8383r4 <- plot_sens_P
+plot_sens_conc_combine_8383r4 <- cowplot::plot_grid(plotlist = plot_sens_conc, nrow = 2)
+plot_sens_rates_combine_8383r4 <- cowplot::plot_grid(plotlist = plot_sens_rates, nrow = 3)
+
+plot_sens_S_8383r4
+plot_sens_P_8383r4
+plot_sens_conc_combine_8383r4
+plot_sens_rates_combine_8383r4
+beep(sound=4)
+```
+```{r}
+```
+

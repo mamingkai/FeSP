@@ -1,6 +1,6 @@
 ---
 README
-Date: 14 August 2024
+Date: 20 Sept. 2024
 
 Project Overview
 This repository contains the models and data for the paper titled "Kinetics of the Release of Adsorbed Phosphate Accompanying the Reaction of Lepidocrocite (gamma-FeOOH) with Dissolved Sulfide."
